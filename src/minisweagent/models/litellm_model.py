@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -28,6 +29,8 @@ class LitellmModelConfig(BaseModel):
     """Model name. Highly recommended to include the provider in the model name, e.g., `anthropic/claude-sonnet-4-5-20250929`."""
     model_kwargs: dict[str, Any] = {}
     """Additional arguments passed to the API."""
+    reasoning_mode: Literal["default", "off"] = "default"
+    """Control provider-specific reasoning/thinking features when supported. Unsupported models are left unchanged."""
     litellm_model_registry: Path | str | None = os.getenv("LITELLM_MODEL_REGISTRY_PATH")
     """Model registry for cost tracking and model metadata. See the local model guide (https://mini-swe-agent.com/latest/models/local_models/) for more details."""
     set_cache_control: Literal["default_end"] | None = None
@@ -52,13 +55,49 @@ class LitellmModel:
         litellm.exceptions.PermissionDeniedError,
         litellm.exceptions.ContextWindowExceededError,
         litellm.exceptions.AuthenticationError,
+        litellm.exceptions.Timeout,
         KeyboardInterrupt,
     ]
+    _api_timeout_exception = getattr(litellm.exceptions, "APITimeoutError", None)
+    if _api_timeout_exception is not None:
+        abort_exceptions.append(_api_timeout_exception)
 
     def __init__(self, *, config_class: Callable = LitellmModelConfig, **kwargs):
         self.config = config_class(**kwargs)
         if self.config.litellm_model_registry and Path(self.config.litellm_model_registry).is_file():
             litellm.utils.register_model(json.loads(Path(self.config.litellm_model_registry).read_text()))
+
+    @staticmethod
+    def _merge_nested_dicts(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(base)
+        for key, value in overlay.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = LitellmModel._merge_nested_dicts(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+
+    def _get_effective_model_kwargs(self, **kwargs) -> dict[str, Any]:
+        model_kwargs = self.config.model_kwargs | kwargs
+        if self.config.reasoning_mode != "off":
+            return model_kwargs
+
+        model_name = self.config.model_name or ""
+        leaf_model_name = model_name.split("/", 1)[1] if "/" in model_name else model_name
+        provider = model_name.split("/", 1)[0] if "/" in model_name else ""
+        api_base = model_kwargs.get("api_base") or model_kwargs.get("base_url") or ""
+        custom_provider = model_kwargs.get("custom_llm_provider") or provider
+        is_openai_compatible = custom_provider == "openai" or provider == "openai"
+        is_local_endpoint = isinstance(api_base, str) and bool(re.search(r"(127\.0\.0\.1|localhost)", api_base))
+        supports_thinking_toggle = bool(re.match(r"(?i)(qwen|qwq|deepseek-r1)", leaf_model_name))
+
+        if not (is_openai_compatible and is_local_endpoint and supports_thinking_toggle):
+            return model_kwargs
+
+        return self._merge_nested_dicts(
+            model_kwargs,
+            {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
+        )
 
     def _query(self, messages: list[dict[str, str]], **kwargs):
         try:
@@ -66,7 +105,7 @@ class LitellmModel:
                 model=self.config.model_name,
                 messages=messages,
                 tools=[BASH_TOOL],
-                **(self.config.model_kwargs | kwargs),
+                **self._get_effective_model_kwargs(**kwargs),
             )
         except litellm.exceptions.AuthenticationError as e:
             e.message += " You can permanently set your API key with `mini-extra config set KEY VALUE`."

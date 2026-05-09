@@ -12,6 +12,8 @@ from minisweagent.models import get_model
 from minisweagent.run.benchmarks.swebench import (
     DATASET_MAPPING,
     get_sb_environment,
+    maybe_sync_model_name_to_config,
+    normalize_model_provider_prefix,
 )
 from minisweagent.utils.log import logger
 from minisweagent.utils.serialize import UNSET, recursive_merge
@@ -51,6 +53,7 @@ def main(
     yolo: bool = typer.Option(False, "-y", "--yolo", help="Run without confirmation"),
     cost_limit: float | None = typer.Option(None, "-l", "--cost-limit", help="Cost limit. Set to 0 to disable."),
     config_spec: list[str] = typer.Option([str(DEFAULT_CONFIG_FILE)], "-c", "--config", help=_CONFIG_SPEC_HELP_TEXT, rich_help_panel="Basic"),
+    sync_model_name_to_config: bool = typer.Option(False, "--sync-model-name-to-config/--no-sync-model-name-to-config", help="Persist effective model.model_name back into the first YAML config file when a CLI model override is used.", rich_help_panel="Advanced"),
     exit_immediately: bool = typer.Option(False, "--exit-immediately", help="Exit immediately when the agent wants to finish instead of prompting.", rich_help_panel="Advanced"),
     output: Path | None = typer.Option(DEFAULT_OUTPUT_FILE, "-o", "--output", help="Output trajectory file", rich_help_panel="Basic"),
 ) -> None:
@@ -85,6 +88,13 @@ def main(
         },
     })
     config = recursive_merge(*configs)
+    normalize_model_provider_prefix(config)
+    maybe_sync_model_name_to_config(
+        config_spec,
+        model_option=model_name,
+        merged_config=config,
+        sync_enabled=sync_model_name_to_config,
+    )
 
     env = get_sb_environment(config, instance)
     agent = get_agent(

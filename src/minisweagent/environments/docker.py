@@ -40,6 +40,16 @@ class DockerEnvironmentConfig(BaseModel):
     The actual command will be appended as argument to this. Override this to e.g., modify shell flags
     (e.g., to remove the `-l` flag to disable login shell) or to use python instead of bash to interpret commands.
     """
+    required_fail_to_pass: list[str] = []
+    """Tests that must pass before submission is allowed."""
+    required_pass_to_pass: list[str] = []
+    """Tests that must not regress before submission is allowed."""
+    required_validation_command: str = ""
+    """Preferred full validation command that should be run successfully before submission."""
+    enforce_non_empty_submission: bool = False
+    """When True, block COMPLETE_TASK submission if no patch content is provided."""
+    enforce_patch_sanity: bool = False
+    """When True, require submission content to look like a unified diff patch."""
 
 
 class DockerEnvironment:
@@ -56,6 +66,14 @@ class DockerEnvironment:
         self.logger = logger or logging.getLogger("minisweagent.environment")
         self.container_id: str | None = None
         self.config = config_class(**kwargs)
+        # Submission is allowed only after at least one successful validation command.
+        self._validation_passed = False
+        self._required_fail_to_pass = list(dict.fromkeys(self.config.required_fail_to_pass))
+        self._required_pass_to_pass = list(dict.fromkeys(self.config.required_pass_to_pass))
+        self._required_tests = list(dict.fromkeys(self._required_fail_to_pass + self._required_pass_to_pass))
+        self._required_validation_command = " ".join(self.config.required_validation_command.split())
+        self._enforce_non_empty_submission = bool(self.config.enforce_non_empty_submission)
+        self._enforce_patch_sanity = bool(self.config.enforce_patch_sanity)
         self._start_container()
 
     def get_template_vars(self, **kwargs) -> dict[str, Any]:
@@ -134,14 +152,115 @@ class DockerEnvironment:
                 "exception_info": f"An error occurred while executing the command: {e}",
                 "extra": {"exception_type": type(e).__name__, "exception": str(e)},
             }
+        if output["returncode"] == 0 and self._is_validation_command(command) and self._covers_required_tests(command):
+            self._validation_passed = True
         self._check_finished(output)
         return output
+
+    def _covers_required_tests(self, command: str) -> bool:
+        """Return True only if command covers required tests for this instance."""
+        if not self._required_tests:
+            return True
+        normalized = " ".join(command.strip().split())
+        if self._required_validation_command and normalized == self._required_validation_command:
+            return True
+        return all(test_id in normalized for test_id in self._required_tests)
+
+    def _is_validation_command(self, command: str) -> bool:
+        """Heuristic check for common test/validation commands across ecosystems."""
+        normalized = command.strip().lower()
+        if not normalized:
+            return False
+        validation_patterns = (
+            "pytest",
+            "python -m pytest",
+            "npm test",
+            "pnpm test",
+            "yarn test",
+            "mvn test",
+            "./mvnw test",
+            "gradle test",
+            "./gradlew test",
+            "go test",
+            "cargo test",
+        )
+        return any(pattern in normalized for pattern in validation_patterns)
+
+    @staticmethod
+    def _looks_like_unified_diff(submission: str) -> bool:
+        """Best-effort validation that a submission contains a unified diff patch."""
+        if not submission:
+            return False
+        normalized = submission.strip()
+        has_diff_header = "diff --git " in normalized
+        has_file_markers = "\n--- " in f"\n{normalized}" and "\n+++ " in f"\n{normalized}"
+        has_hunk = "\n@@ " in f"\n{normalized}" or "\n@@" in f"\n{normalized}"
+        return (has_diff_header and has_file_markers) or (has_file_markers and has_hunk)
+
+    @staticmethod
+    def _starts_with_patch_marker(submission: str) -> bool:
+        """Require raw patch content to start immediately, without narrative prefix."""
+        lines = submission.lstrip().splitlines()
+        if not lines:
+            return False
+        first = lines[0]
+        return first.startswith("diff --git ") or first.startswith("--- ") or first.startswith("Index: ")
 
     def _check_finished(self, output: dict):
         """Raises Submitted if the output indicates task completion."""
         lines = output.get("output", "").lstrip().splitlines(keepends=True)
         if lines and lines[0].strip() == "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" and output["returncode"] == 0:
+            if not self._validation_passed:
+                output["returncode"] = 1
+                gate_msg = (
+                    "\n[VALIDATION_GATE] Submission blocked: required tests were not successfully validated.\n"
+                )
+                if self._required_tests:
+                    tests_summary = "\n".join(f"- {test_id}" for test_id in self._required_tests)
+                    gate_msg += (
+                        "Required tests for this instance:\n"
+                        f"{tests_summary}\n"
+                        "Run a successful test command that includes these tests, then submit again.\n"
+                    )
+                    if self._required_validation_command:
+                        gate_msg += f"Recommended command: {self._required_validation_command}\n"
+                else:
+                    gate_msg += "Run relevant tests (e.g. pytest / npm test / mvn test), fix failures, then submit again.\n"
+                output["output"] = output.get("output", "") + gate_msg
+                return
             submission = "".join(lines[1:])
+            if self._enforce_non_empty_submission and not submission.strip():
+                output["returncode"] = 1
+                output["output"] = (
+                    output.get("output", "")
+                    + "\n[VALIDATION_GATE] Submission blocked: empty patch payload.\n"
+                    + "Submit with COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT followed by unified diff content.\n"
+                )
+                return
+            if self._enforce_patch_sanity and submission.strip() and not self._looks_like_unified_diff(submission):
+                output["returncode"] = 1
+                output["output"] = (
+                    output.get("output", "")
+                    + "\n[VALIDATION_GATE] Submission blocked: payload does not look like a valid unified diff patch.\n"
+                    + "Include raw git diff output only (no markdown fences or narrative text).\n"
+                )
+                return
+            if self._enforce_patch_sanity and submission.strip() and "```" in submission:
+                output["returncode"] = 1
+                output["output"] = (
+                    output.get("output", "")
+                    + "\n[VALIDATION_GATE] Submission blocked: markdown code fences are not allowed.\n"
+                    + "Submit raw diff text only.\n"
+                )
+                return
+            if self._enforce_patch_sanity and submission.strip() and not self._starts_with_patch_marker(submission):
+                output["returncode"] = 1
+                output["output"] = (
+                    output.get("output", "")
+                    + "\n[VALIDATION_GATE] Submission blocked: patch must start at the first non-whitespace line.\n"
+                    + "Remove summary/explanatory text and submit raw diff only.\n"
+                )
+                return
             raise Submitted(
                 {
                     "role": "exit",

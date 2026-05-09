@@ -1,0 +1,202 @@
+agent:
+  system_template: 'You are a helpful assistant that can interact with a computer
+    shell to solve programming tasks.
+
+    '
+  instance_template: "<feature_request>\nConsider the following feature request:\n\
+    {{task}}\n</feature_request>\n\n<instructions>\n# Task Instructions\n\n## Overview\n\
+    \nYou're a software engineer interacting continuously with a computer by submitting\
+    \ commands.\nYou'll be helping implement a new feature in a code repository based\
+    \ on the feature request above.\nYour task is to make changes to non-test files\
+    \ in `/testbed` so that the new feature described\nin the request is correctly\
+    \ implemented in a way that is general and consistent with the codebase.\n<IMPORTANT>This\
+    \ is an interactive process where you will think and issue AT LEAST ONE command,\
+    \ see the result, then think and issue your next command(s).</important>\n\nFor\
+    \ each response:\n\n1. Include a THOUGHT section explaining your reasoning and\
+    \ what you're trying to accomplish\n2. Provide one or more bash tool calls to\
+    \ execute\n\n## Important Boundaries\n\n- MODIFY: Regular source code files in\
+    \ /testbed (this is the working directory for all your subsequent commands)\n\
+    - YOU MAY ALSO ADD test methods to existing test files if the required FAIL_TO_PASS\
+    \ tests do not yet exist\n- DO NOT MODIFY: Configuration files (pyproject.toml,\
+    \ setup.cfg, etc.)\n\n## Recommended Workflow\n\n1. Analyze the codebase by finding\
+    \ and reading relevant files\n2. Check whether the required FAIL_TO_PASS test\
+    \ methods already exist in the test file\n   - If they DO NOT exist, you must\
+    \ ADD them as part of your implementation\n3. Implement the required feature changes\
+    \ in source files\n4. Add any missing test methods to the test file\n5. Run the\
+    \ validation command ONLY AFTER both the feature code AND test methods are in\
+    \ place\n6. Fix any failures and re-run until all required tests pass\n\n## Pre-Submission\
+    \ Validation Gate (MANDATORY - MUST PASS BEFORE SUBMISSION)\n\nBefore creating\
+    \ and submitting patch.txt, you MUST validate your changes using the tests below.\n\
+    \n### Required Test Validation\n\nThe following tests MUST all pass before you\
+    \ submit:\n\n**Test Command:**\n```\n{{validation_command}}\n```\n\n**Tests that\
+    \ must pass (FAIL_TO_PASS):**\n{% for test in fail_to_pass %}\n- `{{test}}`\n\
+    {% endfor %}\n\n**Tests that must NOT regress (PASS_TO_PASS):**\n{% for test in\
+    \ pass_to_pass %}\n- `{{test}}`\n{% endfor %}\n\n### Validation Loop (Mandatory)\n\
+    \nYou MUST follow this exact process:\n\n1. Implement the feature source code\n\
+    2. Add any missing test methods to the test file (tests in FAIL_TO_PASS may NOT\
+    \ exist yet in the base repo \u2014 add them!)\n3. Run the exact test command\
+    \ shown above\n4. If tests fail (or pytest reports \"found no collectors\" \u2014\
+    \ that means the test method doesn't exist yet):\n   - Analyze the failure\n \
+    \  - Fix the code or add the missing test methods\n   - Re-run the test command\n\
+    \   - Repeat until all tests pass\n5. Only after ALL tests pass (returncode 0),\
+    \ proceed to patch creation and submission\n\n**CRITICAL:** If pytest says \"\
+    found no collectors\" for a test ID, it means you have NOT added that test method\
+    \ to the test file yet. Add it, then run pytest again.\n\n**CRITICAL:** `python3\
+    \ -c` or manual Python validation does NOT count. You MUST run the exact pytest\
+    \ command above and see it succeed with returncode 0.\n\n## Command Execution\
+    \ Rules\n\nYou are operating in an environment where\n\n1. You issue at least\
+    \ one command\n2. The system executes the command(s) in a subshell\n3. You see\
+    \ the result(s)\n4. You write your next command(s)\n\nEach response should include:\n\
+    \n1. **Reasoning text** where you explain your analysis and plan\n2. At least\
+    \ one tool call with your command\n\n**CRITICAL REQUIREMENTS:**\n\n- Your response\
+    \ SHOULD include reasoning text explaining what you're doing\n- Your response\
+    \ MUST include AT LEAST ONE bash tool call. You can make MULTIPLE tool calls in\
+    \ a single response when the commands are independent (e.g., searching multiple\
+    \ files, reading different parts of the codebase).\n- Directory or environment\
+    \ variable changes are not persistent. Every action is executed in a new subshell.\n\
+    - However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir\
+    \ && ...` or write/load environment variables from files\n\nExample of a CORRECT\
+    \ response:\n<example_response>\nI need to understand the existing code structure.\
+    \ Let me find relevant files.\n\n[Makes multiple bash tool calls: {\"command\"\
+    : \"ls /testbed\"}, {\"command\": \"find /testbed/src -name '*.py' | head -20\"\
+    }]\n</example_response>\n\n## Environment Details\n\n- You have a full Linux shell\
+    \ environment\n- Always use non-interactive flags (-y, -f) for commands\n- Avoid\
+    \ interactive tools like vi, nano, or any that require user input\n- You can use\
+    \ bash commands or invoke any tool that is available in the environment\n- Working\
+    \ directory is /testbed\n\n## Submission\n\nWhen you've completed your work, you\
+    \ MUST submit your changes as a git patch.\nFollow these steps IN ORDER, with\
+    \ SEPARATE commands:\n\nStep 0: Ensure validation passed\nConfirm that your latest\
+    \ validation command(s) passed for the modified code.\n\nStep 1: Create the patch\
+    \ file\nRun `git diff -- path/to/file1 path/to/file2 > patch.txt` listing only\
+    \ the source files you modified.\nDo NOT commit your changes.\n\n<IMPORTANT>\n\
+    The patch must only contain changes you made to implement the feature:\n- Source\
+    \ code files you modified or created\n- Test methods you ADDED to existing test\
+    \ files (only if you added them for this feature)\n\nDo not include:\n- Installation,\
+    \ build, packaging, configuration, or setup scripts\n- Binary or compiled files\n\
+    - Helper scripts or tools you created that are not part of the feature\n</IMPORTANT>\n\
+    \nStep 2: Verify your patch\nInspect patch.txt to confirm it only contains your\
+    \ intended changes and headers show `--- a/` and `+++ b/` paths.\n\nStep 3: Submit\
+    \ (EXACT command required)\nYou MUST use this EXACT command to submit:\n\n```bash\n\
+    echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat patch.txt\n```\n\nIf the command\
+    \ fails (nonzero exit status), it will not submit.\n\n<CRITICAL>\n- Creating/viewing\
+    \ the patch and submitting it MUST be separate commands (not combined with &&).\n\
+    - If you modify patch.txt after verifying, you SHOULD verify again before submitting.\n\
+    - You CANNOT continue working (reading, editing, testing) in any way on this task\
+    \ after submitting.\n</CRITICAL>\n</instructions>\n"
+  step_limit: 250
+  cost_limit: 3.0
+run:
+  env_startup_command: 'set -e
+
+    git clone --depth=50 https://github.com/{{ repo }} /testbed 2>&1
+
+    cd /testbed
+
+    git fetch --depth=1 origin {{ base_commit }} 2>/dev/null || true
+
+    git checkout {{ base_commit }}
+
+    pip install -e . -q 2>&1 | tail -5 || pip install -r requirements.txt -q 2>&1
+    | tail -5 || true
+
+    '
+environment:
+  image: fea-unified:latest
+  cwd: /testbed
+  timeout: 300
+  interpreter:
+  - bash
+  - -c
+  env:
+    PAGER: cat
+    MANPAGER: cat
+    LESS: -R
+    PIP_PROGRESS_BAR: 'off'
+    TQDM_DISABLE: '1'
+  environment_class: docker
+model:
+  observation_template: '{% if output.exception_info -%}
+
+    <exception>{{output.exception_info}}</exception>
+
+    {% endif -%}
+
+    <returncode>{{output.returncode}}</returncode>
+
+    {% if output.output | length < 10000 -%}
+
+    <output>
+
+    {{ output.output -}}
+
+    </output>
+
+    {%- else -%}
+
+    <warning>
+
+    The output of your last command was too long.
+
+    Please try a different command that produces less output.
+
+    If you''re using grep or find and it produced too much output, you can use a more
+    selective search pattern.
+
+    </warning>
+
+    {%- set elided_chars = output.output | length - 10000 -%}
+
+    <output_head>
+
+    {{ output.output[:5000] }}
+
+    </output_head>
+
+    <elided_chars>
+
+    {{ elided_chars }} characters elided
+
+    </elided_chars>
+
+    <output_tail>
+
+    {{ output.output[-5000:] }}
+
+    </output_tail>
+
+    {%- endif -%}
+
+    '
+  format_error_template: 'Tool call error:
+
+
+    <error>
+
+    {{error}}
+
+    </error>
+
+
+    Every response needs to use the ''bash'' tool at least once to execute commands.
+
+
+    Call the bash tool with your command as the argument:
+
+    - Tool: bash
+
+    - Arguments: {"command": "your_command_here"}
+
+
+    If you have completed your assignment, please consult the first message about
+    how to
+
+    submit your solution (you will not be able to continue working on this task after
+    that).
+
+    '
+  model_name: openai/qwen3.6-27b
+  model_kwargs:
+    drop_params: true
+    temperature: 0.0
+    parallel_tool_calls: true
+  cost_tracking: ignore_errors

@@ -5,6 +5,7 @@
 
 import concurrent.futures
 import json
+import os
 import random
 import re
 import threading
@@ -13,13 +14,15 @@ import traceback
 from pathlib import Path
 
 import typer
+import yaml
 from jinja2 import StrictUndefined, Template
 from rich.live import Live
 
 from minisweagent import Environment
 from minisweagent.agents.default import DefaultAgent
-from minisweagent.config import builtin_config_dir, get_config_from_spec
+from minisweagent.config import builtin_config_dir, get_config_from_spec, get_config_path
 from minisweagent.environments import get_environment
+from minisweagent.exceptions import InterruptAgentFlow
 from minisweagent.models import get_model
 from minisweagent.run.benchmarks.utils.batch_progress import RunBatchProgressManager
 from minisweagent.utils.log import add_file_handler, logger
@@ -65,18 +68,222 @@ app = typer.Typer(rich_markup_mode="rich", add_completion=False)
 _OUTPUT_FILE_LOCK = threading.Lock()
 
 
+def _parse_key_value_value(raw_value: str):
+    try:
+        return json.loads(raw_value)
+    except json.JSONDecodeError:
+        return raw_value
+
+
+def _extract_cli_model_override(config_spec: list[str], model_option: str | None) -> str | None:
+    if model_option:
+        return model_option
+    for spec in reversed(config_spec):
+        if isinstance(spec, str) and spec.startswith("model.model_name="):
+            return str(_parse_key_value_value(spec.split("=", 1)[1]))
+    return None
+
+
+def _first_yaml_spec(config_spec: list[str]) -> str | None:
+    for spec in config_spec:
+        if isinstance(spec, str) and "=" not in spec:
+            return spec
+    return None
+
+
+def maybe_sync_model_name_to_config(
+    config_spec: list[str],
+    *,
+    model_option: str | None,
+    merged_config: dict,
+    sync_enabled: bool,
+) -> None:
+    """Optionally persist the final model name into the first YAML config spec."""
+    if not sync_enabled:
+        return
+
+    cli_model_name = _extract_cli_model_override(config_spec, model_option)
+    if not cli_model_name:
+        logger.info("Model sync enabled, but no CLI model override was provided. Skipping sync.")
+        return
+
+    yaml_spec = _first_yaml_spec(config_spec)
+    if not yaml_spec:
+        logger.warning("Model sync enabled, but no YAML config spec was provided. Skipping sync.")
+        return
+
+    try:
+        config_path = get_config_path(yaml_spec)
+        config_data = yaml.safe_load(config_path.read_text()) or {}
+        if not isinstance(config_data, dict):
+            logger.warning("Config file is not a YAML mapping, cannot sync model name: %s", config_path)
+            return
+        effective_model_name = merged_config.get("model", {}).get("model_name") if isinstance(merged_config, dict) else None
+        if not effective_model_name:
+            logger.warning("Cannot determine effective model name for sync. Skipping sync.")
+            return
+        model_block = config_data.setdefault("model", {})
+        if not isinstance(model_block, dict):
+            logger.warning("Config key 'model' is not a mapping in %s, cannot sync model name.", config_path)
+            return
+        previous_model_name = model_block.get("model_name")
+        if previous_model_name == effective_model_name:
+            logger.info("Config model.model_name already matches runtime model: %s", effective_model_name)
+            return
+        model_block["model_name"] = effective_model_name
+        config_path.write_text(yaml.safe_dump(config_data, sort_keys=False))
+        logger.info(
+            "Synchronized config model.model_name in %s: %s -> %s",
+            config_path,
+            previous_model_name,
+            effective_model_name,
+        )
+    except Exception as e:
+        logger.warning("Failed to synchronize model.model_name to config: %s", e)
+
+
+def normalize_model_provider_prefix(config: dict) -> None:
+    """Normalize model provider prefix for OpenAI-compatible endpoints.
+
+    If model_name has no explicit provider prefix but an OpenAI-compatible
+    base URL is configured, prefix with "openai/" to avoid LiteLLM provider
+    resolution errors.
+    """
+    if not isinstance(config, dict):
+        return
+    model_block = config.get("model")
+    if not isinstance(model_block, dict):
+        return
+
+    model_name = model_block.get("model_name")
+    if not isinstance(model_name, str) or not model_name.strip():
+        return
+
+    provider_prefixes = (
+        "openai/",
+        "anthropic/",
+        "gemini/",
+        "ollama/",
+        "azure/",
+        "vertex_ai/",
+        "bedrock/",
+        "groq/",
+        "mistral/",
+        "cohere/",
+        "deepseek/",
+        "xai/",
+        "fireworks_ai/",
+        "together_ai/",
+        "openrouter/",
+    )
+    if model_name.startswith(provider_prefixes):
+        return
+
+    model_kwargs = model_block.get("model_kwargs")
+    if not isinstance(model_kwargs, dict):
+        return
+    base_url = model_kwargs.get("base_url") or model_kwargs.get("api_base")
+    if not isinstance(base_url, str) or not base_url.strip():
+        return
+
+    normalized_model_name = model_name
+    if model_name.startswith("qwen/"):
+        normalized_model_name = model_name.split("/", 1)[1]
+
+    model_block["model_name"] = f"openai/{normalized_model_name}"
+    logger.info(
+        "Auto-normalized model name for OpenAI-compatible endpoint: %s -> %s",
+        model_name,
+        model_block["model_name"],
+    )
+
+
 class ProgressTrackingAgent(DefaultAgent):
     """Simple wrapper around DefaultAgent that provides progress updates."""
 
-    def __init__(self, *args, progress_manager: RunBatchProgressManager, instance_id: str = "", **kwargs):
+    def __init__(
+        self,
+        *args,
+        progress_manager: RunBatchProgressManager,
+        instance_id: str = "",
+        repeat_action_limit: int = 6,
+        echo_action_limit: int = 10,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.progress_manager: RunBatchProgressManager = progress_manager
         self.instance_id = instance_id
+        self.repeat_action_limit = max(2, int(repeat_action_limit))
+        self.echo_action_limit = max(3, int(echo_action_limit))
+        self._last_action_signature: str | None = None
+        self._same_action_streak = 0
+        self._echo_action_streak = 0
+
+    @staticmethod
+    def _normalize_command(command: str) -> str:
+        return " ".join((command or "").strip().split())
+
+    @staticmethod
+    def _is_echo_like(command: str) -> bool:
+        c = command.lower().strip()
+        return c.startswith("echo ") or c.startswith("printf ")
+
+    def _maybe_abort_loop(self, actions: list[dict]) -> None:
+        commands = [self._normalize_command(a.get("command", "")) for a in actions]
+        commands = [c for c in commands if c]
+        if not commands:
+            self._same_action_streak = 0
+            self._echo_action_streak = 0
+            self._last_action_signature = None
+            return
+
+        signature = " || ".join(commands)
+        if signature == self._last_action_signature:
+            self._same_action_streak += 1
+        else:
+            self._same_action_streak = 1
+            self._last_action_signature = signature
+
+        if all(self._is_echo_like(c) for c in commands):
+            self._echo_action_streak += 1
+        else:
+            self._echo_action_streak = 0
+
+        if self._same_action_streak < self.repeat_action_limit and self._echo_action_streak < self.echo_action_limit:
+            return
+
+        reason = (
+            f"LoopDetected: repeated identical actions {self._same_action_streak}x"
+            if self._same_action_streak >= self.repeat_action_limit
+            else f"LoopDetected: echo-like actions {self._echo_action_streak}x"
+        )
+        raise InterruptAgentFlow(
+            self.model.format_message(
+                role="exit",
+                content=reason,
+                extra={
+                    "exit_status": "LoopDetected",
+                    "submission": "",
+                    "loop_guard": {
+                        "same_action_streak": self._same_action_streak,
+                        "echo_action_streak": self._echo_action_streak,
+                        "repeat_action_limit": self.repeat_action_limit,
+                        "echo_action_limit": self.echo_action_limit,
+                        "last_action_signature": signature[:500],
+                    },
+                },
+            )
+        )
 
     def step(self) -> dict:
         """Override step to provide progress updates."""
         self.progress_manager.update_instance_status(self.instance_id, f"Step {self.n_calls + 1:3d} (${self.cost:.2f})")
         return super().step()
+
+    def execute_actions(self, message: dict) -> list[dict]:
+        actions = message.get("extra", {}).get("actions", [])
+        self._maybe_abort_loop(actions)
+        return super().execute_actions(message)
 
 
 def get_swebench_docker_image_name(instance: dict) -> str:
@@ -90,19 +297,39 @@ def get_swebench_docker_image_name(instance: dict) -> str:
     return image_name
 
 
-def get_sb_environment(config: dict, instance: dict) -> Environment:
-    env_config = config.setdefault("environment", {})
+def get_sb_environment(
+    config: dict,
+    instance: dict,
+    *,
+    fail_to_pass: list[str],
+    pass_to_pass: list[str],
+    validation_command: str,
+    feedback_loop: bool = True,
+) -> Environment:
+    # Use a per-instance environment config copy to avoid cross-instance leakage in parallel runs.
+    env_config = dict(config.get("environment", {}))
     env_config["environment_class"] = env_config.get("environment_class", "docker")
-    image_name = get_swebench_docker_image_name(instance)
-    if env_config["environment_class"] in ["docker", "swerex_modal"]:
-        env_config["image"] = image_name
-    elif env_config["environment_class"] in ["singularity", "contree"]:
-        env_config["image"] = "docker://" + image_name
+    
+    # Use instance docker_image if not already set in config
+    if "image" not in env_config:
+        image_name = get_swebench_docker_image_name(instance)
+        if env_config["environment_class"] in ["docker", "swerex_modal"]:
+            env_config["image"] = image_name
+        elif env_config["environment_class"] in ["singularity", "contree"]:
+            env_config["image"] = "docker://" + image_name
+
+    # Inject validation contract only when feedback-loop mode is active.
+    if feedback_loop:
+        env_config["required_fail_to_pass"] = fail_to_pass
+        env_config["required_pass_to_pass"] = pass_to_pass
+        env_config["required_validation_command"] = validation_command
+        env_config["enforce_non_empty_submission"] = True
+        env_config["enforce_patch_sanity"] = True
 
     env = get_environment(env_config)
     if startup_command := config.get("run", {}).get("env_startup_command"):
         startup_command = Template(startup_command, undefined=StrictUndefined).render(**instance)
-        out = env.execute(startup_command)
+        out = env.execute({"command": startup_command})
         if out["returncode"] != 0:
             raise RuntimeError(f"Error executing startup command: {out}")
     return env
@@ -122,6 +349,62 @@ def update_preds_file(output_path: Path, instance_id: str, model_name: str, resu
         output_path.write_text(json.dumps(output_data, indent=2))
 
 
+def normalize_patch_for_harness(patch: str) -> str:
+    """Normalize git patch headers to the a/ b/ form expected by swebench harness."""
+    if not patch:
+        return patch
+
+    normalized_lines: list[str] = []
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            m = re.match(r"^diff --git\s+(\S+)\s+(\S+)$", line)
+            if m:
+                left, right = m.group(1), m.group(2)
+                if not left.startswith(("a/", "b/")):
+                    left = f"a/{left}"
+                if not right.startswith(("a/", "b/")):
+                    right = f"b/{right}"
+                line = f"diff --git {left} {right}"
+        elif line.startswith("--- "):
+            path = line[4:]
+            if path != "/dev/null" and not path.startswith(("a/", "b/")):
+                line = f"--- a/{path}"
+        elif line.startswith("+++ "):
+            path = line[4:]
+            if path != "/dev/null" and not path.startswith(("a/", "b/")):
+                line = f"+++ b/{path}"
+        normalized_lines.append(line)
+
+    return "\n".join(normalized_lines) + ("\n" if patch.endswith("\n") else "")
+
+
+def sanitize_feedback_submission(submission: str) -> str:
+    """Clean common wrapper noise from feedback-loop submissions while keeping raw diff content."""
+    if not submission:
+        return submission
+
+    cleaned = submission.replace("\r\n", "\n")
+    lines = cleaned.splitlines()
+
+    # Remove markdown code fences if present.
+    if "```" in cleaned:
+        lines = [line for line in lines if not line.strip().startswith("```")]
+
+    patch_markers = ("diff --git ", "--- ", "Index: ")
+    start_idx = None
+    for idx, line in enumerate(lines):
+        if any(line.startswith(marker) for marker in patch_markers):
+            start_idx = idx
+            break
+    if start_idx is not None:
+        lines = lines[start_idx:]
+
+    cleaned = "\n".join(lines)
+    if submission.endswith("\n") and cleaned:
+        cleaned += "\n"
+    return cleaned
+
+
 def remove_from_preds_file(output_path: Path, instance_id: str):
     """Remove an instance from the predictions file."""
     if not output_path.exists():
@@ -133,11 +416,23 @@ def remove_from_preds_file(output_path: Path, instance_id: str):
             output_path.write_text(json.dumps(output_data, indent=2))
 
 
+def build_validation_command(instance: dict) -> str:
+    """Build a focused pytest command from instance-specific target tests."""
+    tests = [*(instance.get("FAIL_TO_PASS") or []), *(instance.get("PASS_TO_PASS") or [])]
+    unique_tests = list(dict.fromkeys(tests))
+    if unique_tests:
+        return "pytest --no-header -rA --tb=no -p no:cacheprovider " + " ".join(unique_tests)
+    return "pytest --no-header -rA --tb=no -p no:cacheprovider"
+
+
 def process_instance(
     instance: dict,
     output_dir: Path,
     config: dict,
     progress_manager: RunBatchProgressManager,
+    feedback_loop: bool = True,
+    repeat_action_limit: int = 6,
+    echo_action_limit: int = 10,
 ) -> None:
     """Process a single SWEBench instance."""
     instance_id = instance["instance_id"]
@@ -157,17 +452,40 @@ def process_instance(
     extra_info = {}
 
     try:
-        env = get_sb_environment(config, instance)
+        fail_to_pass = instance.get("FAIL_TO_PASS", []) or []
+        pass_to_pass = instance.get("PASS_TO_PASS", []) or []
+        validation_command = build_validation_command(instance)
+
+        env = get_sb_environment(
+            config,
+            instance,
+            fail_to_pass=fail_to_pass,
+            pass_to_pass=pass_to_pass,
+            validation_command=validation_command,
+            feedback_loop=feedback_loop,
+        )
         agent = ProgressTrackingAgent(
             model,
             env,
             progress_manager=progress_manager,
             instance_id=instance_id,
+            repeat_action_limit=repeat_action_limit,
+            echo_action_limit=echo_action_limit,
             **config.get("agent", {}),
         )
-        info = agent.run(task)
+        # Pass test information to agent for validation
+        info = agent.run(
+            task,
+            test_cmd=instance.get("test_cmd", ""),
+            validation_command=validation_command,
+            fail_to_pass=fail_to_pass,
+            pass_to_pass=pass_to_pass,
+        )
         exit_status = info.get("exit_status")
-        result = info.get("submission")
+        submission = info.get("submission") or ""
+        if feedback_loop:
+            submission = sanitize_feedback_submission(submission)
+        result = normalize_patch_for_harness(submission)
     except Exception as e:
         logger.error(f"Error processing instance {instance_id}: {e}", exc_info=True)
         exit_status, result = type(e).__name__, ""
@@ -226,18 +544,31 @@ def main(
     redo_existing: bool = typer.Option(False, "--redo-existing", help="Redo existing instances", rich_help_panel="Data selection"),
     config_spec: list[str] = typer.Option([str(DEFAULT_CONFIG_FILE)], "-c", "--config", help=_CONFIG_SPEC_HELP_TEXT, rich_help_panel="Basic"),
     environment_class: str | None = typer.Option(None, "--environment-class", help="Environment type to use. Recommended are docker or singularity", rich_help_panel="Advanced"),
+    feedback_loop: bool = typer.Option(True, "--feedback-loop/--no-feedback-loop", help="Enable hard validation gate (feedback-in-loop). Use --no-feedback-loop for baseline mini-swe-agent behavior.", rich_help_panel="Basic"),
+    repeat_action_limit: int = typer.Option(12, "--repeat-action-limit", help="Abort an instance when the exact same action set repeats this many consecutive steps.", rich_help_panel="Advanced"),
+    echo_action_limit: int = typer.Option(18, "--echo-action-limit", help="Abort an instance when echo/printf-only actions repeat this many consecutive steps.", rich_help_panel="Advanced"),
+    model_timeout_seconds: int = typer.Option(180, "--model-timeout-seconds", help="Per-request model timeout in seconds (applied if model.model_kwargs.timeout is not explicitly set).", rich_help_panel="Advanced"),
+    model_retry_attempts: int = typer.Option(2, "--model-retry-attempts", help="Max model retry attempts for transient API errors. Lower values fail fast and continue to next instance.", rich_help_panel="Advanced"),
+    sync_model_name_to_config: bool = typer.Option(False, "--sync-model-name-to-config/--no-sync-model-name-to-config", help="Persist effective model.model_name back into the first YAML config file when a CLI model override is used.", rich_help_panel="Advanced"),
 ) -> None:
     # fmt: on
+    from datasets import load_dataset, load_from_disk
+    from pathlib import Path
+
     output_path = Path(output)
     output_path.mkdir(parents=True, exist_ok=True)
     logger.info(f"Results will be saved to {output_path}")
     add_file_handler(output_path / "minisweagent.log")
 
-    from datasets import load_dataset
-
     dataset_path = DATASET_MAPPING.get(subset, subset)
     logger.info(f"Loading dataset {dataset_path}, split {split}...")
-    instances = list(load_dataset(dataset_path, split=split))
+    
+    # Handle both remote (HuggingFace) and local dataset paths
+    if Path(dataset_path).exists():
+        dataset = load_from_disk(dataset_path)
+        instances = list(dataset[split])
+    else:
+        instances = list(load_dataset(dataset_path, split=split))
 
     instances = filter_instances(instances, filter_spec=filter_spec, slice_spec=slice_spec, shuffle=shuffle)
     if not redo_existing and (output_path / "preds.json").exists():
@@ -253,6 +584,25 @@ def main(
         "model": {"model_name": model or UNSET, "model_class": model_class or UNSET},
     })
     config = recursive_merge(*configs)
+    normalize_model_provider_prefix(config)
+    maybe_sync_model_name_to_config(
+        config_spec,
+        model_option=model,
+        merged_config=config,
+        sync_enabled=sync_model_name_to_config,
+    )
+
+    # Fail fast on stuck model generations and continue with remaining instances.
+    os.environ["MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT"] = str(max(1, model_retry_attempts))
+    model_config = config.setdefault("model", {})
+    model_kwargs = model_config.setdefault("model_kwargs", {})
+    if model_timeout_seconds > 0 and "timeout" not in model_kwargs:
+        model_kwargs["timeout"] = model_timeout_seconds
+    logger.info(
+        "Model safeguards enabled: timeout=%ss, retry_attempts=%s",
+        model_kwargs.get("timeout", "unset"),
+        os.environ["MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT"],
+    )
 
     progress_manager = RunBatchProgressManager(len(instances), output_path / f"exit_statuses_{time.time()}.yaml")
 
@@ -270,7 +620,16 @@ def main(
     with Live(progress_manager.render_group, refresh_per_second=4):
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
-                executor.submit(process_instance, instance, output_path, config, progress_manager): instance[
+                executor.submit(
+                    process_instance,
+                    instance,
+                    output_path,
+                    config,
+                    progress_manager,
+                    feedback_loop,
+                    repeat_action_limit,
+                    echo_action_limit,
+                ): instance[
                     "instance_id"
                 ]
                 for instance in instances
