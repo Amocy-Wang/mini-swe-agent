@@ -175,3 +175,5 @@ model:
     drop_params: true
     temperature: 0.0
     parallel_tool_calls: true
+  # Match fea-bench behavior: do not fail runs when LiteLLM has no pricing map for a custom model ID.
+  cost_tracking: ignore_errors

@@ -67,6 +67,9 @@ DATASET_MAPPING = {
 app = typer.Typer(rich_markup_mode="rich", add_completion=False)
 _OUTPUT_FILE_LOCK = threading.Lock()
 
+_MAX_CONTEXT_ITEMS = 12
+_MAX_HINTS_CHARS = 1200
+
 
 def _parse_key_value_value(raw_value: str):
     try:
@@ -416,13 +419,140 @@ def remove_from_preds_file(output_path: Path, instance_id: str):
             output_path.write_text(json.dumps(output_data, indent=2))
 
 
+def _normalize_required_tests(value: object) -> list[str]:
+    """Normalize required test fields that may arrive as JSON-encoded strings."""
+    if value is None:
+        return []
+
+    parsed = value
+    if isinstance(value, str):
+        parsed = _parse_key_value_value(value)
+
+    if isinstance(parsed, list):
+        return [str(item) for item in parsed if item]
+    if isinstance(parsed, tuple):
+        return [str(item) for item in parsed if item]
+    if isinstance(parsed, set):
+        return [str(item) for item in parsed if item]
+    return []
+
+
 def build_validation_command(instance: dict) -> str:
     """Build a focused pytest command from instance-specific target tests."""
-    tests = [*(instance.get("FAIL_TO_PASS") or []), *(instance.get("PASS_TO_PASS") or [])]
+    tests = [
+        *_normalize_required_tests(instance.get("FAIL_TO_PASS")),
+        *_normalize_required_tests(instance.get("PASS_TO_PASS")),
+    ]
     unique_tests = list(dict.fromkeys(tests))
     if unique_tests:
         return "pytest --no-header -rA --tb=no -p no:cacheprovider " + " ".join(unique_tests)
     return "pytest --no-header -rA --tb=no -p no:cacheprovider"
+
+
+def _dedupe_preserve_order(items: list[str]) -> list[str]:
+    return [x for x in dict.fromkeys(items) if x]
+
+
+def _parse_test_nodeid_path(nodeid: str) -> str:
+    if not nodeid:
+        return ""
+    file_part = nodeid.split("::", 1)[0].strip()
+    if file_part.endswith(".py"):
+        return file_part
+    if "/" not in file_part and "." in file_part:
+        dotted = file_part.replace(".", "/")
+        if not dotted.endswith(".py"):
+            dotted += ".py"
+        return dotted
+    return ""
+
+
+def _extract_paths_from_problem_statement(problem_statement: str) -> list[str]:
+    if not problem_statement:
+        return []
+    path_like = re.findall(r"([A-Za-z0-9_./-]+\.(?:py|pyi|json|yaml|yml|toml|ini|cfg|md|txt))", problem_statement)
+    return _dedupe_preserve_order(path_like)
+
+
+def _extract_symbols_from_problem_statement(problem_statement: str) -> list[str]:
+    if not problem_statement:
+        return []
+    candidates = re.findall(r"`([^`]+)`", problem_statement)
+    symbols: list[str] = []
+    for c in candidates:
+        token = c.strip()
+        if not token or "/" in token or token.endswith(".py"):
+            continue
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_\.]*$", token):
+            symbols.append(token)
+    return _dedupe_preserve_order(symbols)
+
+
+def _render_limited_bullets(items: list[str], *, max_items: int = _MAX_CONTEXT_ITEMS) -> str:
+    if not items:
+        return "- (none)"
+    shown = items[:max_items]
+    lines = [f"- {item}" for item in shown]
+    remaining = len(items) - len(shown)
+    if remaining > 0:
+        lines.append(f"- ... and {remaining} more")
+    return "\n".join(lines)
+
+
+def build_feedback_enriched_task(instance: dict, validation_command: str) -> str:
+    """Build a richer feedback-loop task prompt with requirement and dependency context.
+
+    This must only be used when feedback-loop mode is enabled.
+    """
+    base_task = instance.get("problem_statement", "")
+    fail_to_pass = _dedupe_preserve_order(_normalize_required_tests(instance.get("FAIL_TO_PASS")))
+    pass_to_pass = _dedupe_preserve_order(_normalize_required_tests(instance.get("PASS_TO_PASS")))
+    test_paths = _dedupe_preserve_order([_parse_test_nodeid_path(t) for t in [*fail_to_pass, *pass_to_pass]])
+    statement_paths = _extract_paths_from_problem_statement(base_task)
+    statement_symbols = _extract_symbols_from_problem_statement(base_task)
+    related_paths = _dedupe_preserve_order([*statement_paths, *test_paths])
+
+    dependency_roots = []
+    for p in related_paths:
+        root = p.split("/", 1)[0] if "/" in p else p
+        if root:
+            dependency_roots.append(root)
+    dependency_roots = _dedupe_preserve_order(dependency_roots)
+
+    hints_text = (instance.get("hints_text") or "").strip()
+    if hints_text and len(hints_text) > _MAX_HINTS_CHARS:
+        hints_text = hints_text[:_MAX_HINTS_CHARS].rstrip() + "\n... (truncated)"
+
+    enriched_sections = [
+        "\n\n[FEEDBACK-LOOP PREPROCESS CONTEXT]",
+        "Use this analyzed context to craft a minimal, valid patch that is accepted by the harness.",
+        "",
+        "Requirement refinement (must satisfy all):",
+        f"- Fix failing target tests (FAIL_TO_PASS): {len(fail_to_pass)}",
+        f"- Keep passing tests stable (PASS_TO_PASS): {len(pass_to_pass)}",
+        "- Output only a valid unified git diff patch (no markdown wrappers).",
+        f"- Validation command: {validation_command}",
+        "",
+        "Target tests to fix (priority):",
+        _render_limited_bullets(fail_to_pass),
+        "",
+        "Regression guard tests (must remain passing):",
+        _render_limited_bullets(pass_to_pass),
+        "",
+        "Program-analysis: related file paths (from problem + test nodeids):",
+        _render_limited_bullets(related_paths),
+        "",
+        "Program-analysis: likely dependency roots / code areas:",
+        _render_limited_bullets(dependency_roots),
+        "",
+        "Program-analysis: referenced symbols in requirement text:",
+        _render_limited_bullets(statement_symbols),
+    ]
+
+    if hints_text:
+        enriched_sections.extend(["", "Additional hints_text context:", hints_text])
+
+    return base_task + "\n" + "\n".join(enriched_sections)
 
 
 def process_instance(
@@ -452,9 +582,13 @@ def process_instance(
     extra_info = {}
 
     try:
-        fail_to_pass = instance.get("FAIL_TO_PASS", []) or []
-        pass_to_pass = instance.get("PASS_TO_PASS", []) or []
+        fail_to_pass = _normalize_required_tests(instance.get("FAIL_TO_PASS"))
+        pass_to_pass = _normalize_required_tests(instance.get("PASS_TO_PASS"))
         validation_command = build_validation_command(instance)
+
+        # Preprocess and enrich context only when feedback loop is enabled.
+        if feedback_loop:
+            task = build_feedback_enriched_task(instance, validation_command)
 
         env = get_sb_environment(
             config,

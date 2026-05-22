@@ -1,5 +1,6 @@
 import json
 import re
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -8,9 +9,12 @@ from pydantic import BaseModel
 from minisweagent import package_dir
 from minisweagent.models.test_models import DeterministicModel, make_output
 from minisweagent.run.benchmarks.swebench import (
+    build_feedback_enriched_task,
+    build_validation_command,
     filter_instances,
     get_swebench_docker_image_name,
     main,
+    process_instance,
     remove_from_preds_file,
     update_preds_file,
 )
@@ -531,3 +535,143 @@ def test_exception_handling_with_progress_manager(tmp_path, container_executable
 
             # on_uncaught_exception should not be called since exceptions are handled properly
             mock_progress_manager.on_uncaught_exception.assert_not_called()
+
+
+def test_build_feedback_enriched_task_contains_program_analysis_context():
+    instance = {
+        "problem_statement": "Fix parser edge case in src/pkg/core.py and update tests in tests/test_core.py. Check `Parser.normalize` behavior.",
+        "FAIL_TO_PASS": ["tests/test_core.py::test_normalize_edge_case"],
+        "PASS_TO_PASS": ["tests/test_core.py::test_normalize_happy_path"],
+        "hints_text": "Use existing normalization branch.",
+    }
+
+    task = build_feedback_enriched_task(instance, "pytest tests/test_core.py")
+
+    assert "[FEEDBACK-LOOP PREPROCESS CONTEXT]" in task
+    assert "Requirement refinement (must satisfy all):" in task
+    assert "Program-analysis: related file paths" in task
+    assert "tests/test_core.py::test_normalize_edge_case" in task
+    assert "src/pkg/core.py" in task
+    assert "Parser.normalize" in task
+    assert "Validation command: pytest tests/test_core.py" in task
+
+
+def test_build_feedback_enriched_task_truncates_long_hints_text():
+    long_hints = "x" * 2000
+    instance = {
+        "problem_statement": "Fix bug in a.py",
+        "FAIL_TO_PASS": ["tests/test_a.py::test_bug"],
+        "PASS_TO_PASS": [],
+        "hints_text": long_hints,
+    }
+
+    task = build_feedback_enriched_task(instance, "pytest tests/test_a.py")
+
+    assert "Additional hints_text context:" in task
+    assert "... (truncated)" in task
+
+
+def test_build_validation_command_parses_json_string_test_lists():
+    instance = {
+        "FAIL_TO_PASS": '["tests/test_mod.py::test_regression"]',
+        "PASS_TO_PASS": '["tests/test_mod.py::test_ok"]',
+    }
+
+    cmd = build_validation_command(instance)
+
+    assert "tests/test_mod.py::test_regression" in cmd
+    assert "tests/test_mod.py::test_ok" in cmd
+
+
+def test_process_instance_feedback_enabled_uses_enriched_task(tmp_path):
+    class FakeAgent:
+        last_task = None
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, task, **kwargs):
+            FakeAgent.last_task = task
+            return {
+                "exit_status": "Submitted",
+                "submission": "diff --git x.py y.py\n--- x.py\n+++ y.py\n@@ -1 +1 @@\n-a\n+b\n",
+            }
+
+        def save(self, path, payload):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload))
+
+    progress = SimpleNamespace(
+        on_instance_start=lambda *args, **kwargs: None,
+        update_instance_status=lambda *args, **kwargs: None,
+        on_instance_end=lambda *args, **kwargs: None,
+    )
+
+    instance = {
+        "instance_id": "repo__case-1",
+        "problem_statement": "Fix in src/mod.py and validate tests/test_mod.py, keep `normalize` stable",
+        "FAIL_TO_PASS": ["tests/test_mod.py::test_regression"],
+        "PASS_TO_PASS": ["tests/test_mod.py::test_ok"],
+    }
+
+    with patch("minisweagent.run.benchmarks.swebench.get_model") as mock_get_model:
+        mock_get_model.return_value = SimpleNamespace(config=SimpleNamespace(model_name="fake"))
+        with patch("minisweagent.run.benchmarks.swebench.get_sb_environment", return_value=object()):
+            with patch("minisweagent.run.benchmarks.swebench.ProgressTrackingAgent", FakeAgent):
+                process_instance(
+                    instance=instance,
+                    output_dir=tmp_path,
+                    config={},
+                    progress_manager=progress,
+                    feedback_loop=True,
+                )
+
+    assert FakeAgent.last_task is not None
+    assert "[FEEDBACK-LOOP PREPROCESS CONTEXT]" in FakeAgent.last_task
+
+
+def test_process_instance_feedback_disabled_keeps_raw_problem_statement(tmp_path):
+    class FakeAgent:
+        last_task = None
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, task, **kwargs):
+            FakeAgent.last_task = task
+            return {
+                "exit_status": "Submitted",
+                "submission": "diff --git x.py y.py\n--- x.py\n+++ y.py\n@@ -1 +1 @@\n-a\n+b\n",
+            }
+
+        def save(self, path, payload):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload))
+
+    progress = SimpleNamespace(
+        on_instance_start=lambda *args, **kwargs: None,
+        update_instance_status=lambda *args, **kwargs: None,
+        on_instance_end=lambda *args, **kwargs: None,
+    )
+
+    problem_statement = "Fix only this requirement text"
+    instance = {
+        "instance_id": "repo__case-2",
+        "problem_statement": problem_statement,
+        "FAIL_TO_PASS": ["tests/test_mod.py::test_regression"],
+        "PASS_TO_PASS": ["tests/test_mod.py::test_ok"],
+    }
+
+    with patch("minisweagent.run.benchmarks.swebench.get_model") as mock_get_model:
+        mock_get_model.return_value = SimpleNamespace(config=SimpleNamespace(model_name="fake"))
+        with patch("minisweagent.run.benchmarks.swebench.get_sb_environment", return_value=object()):
+            with patch("minisweagent.run.benchmarks.swebench.ProgressTrackingAgent", FakeAgent):
+                process_instance(
+                    instance=instance,
+                    output_dir=tmp_path,
+                    config={},
+                    progress_manager=progress,
+                    feedback_loop=False,
+                )
+
+    assert FakeAgent.last_task == problem_statement
